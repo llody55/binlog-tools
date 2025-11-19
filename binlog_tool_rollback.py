@@ -6,9 +6,34 @@ import argparse
 from datetime import datetime
 from collections import defaultdict
 
+# 输出级别常量
+VERBOSE_QUIET = 0    # 只输出必要信息
+VERBOSE_NORMAL = 1   # 正常输出（默认）
+VERBOSE_DETAIL = 2   # 详细信息
+VERBOSE_DEBUG = 3    # 调试信息
+
+# 全局变量，默认为1
+verbose_level = VERBOSE_NORMAL
+
+def log_quiet(message):
+    if verbose_level >= VERBOSE_QUIET:
+        print(message, file=sys.stderr)
+
+def log_normal(message):
+    if verbose_level >= VERBOSE_NORMAL:
+        print(message, file=sys.stderr)
+
+def log_detail(message):
+    if verbose_level >= VERBOSE_DETAIL:
+        print(message, file=sys.stderr)
+
+def log_debug(message):
+    if verbose_level >= VERBOSE_DEBUG:
+        print(message, file=sys.stderr)
+
 def run_mysqlbinlog(binlog_file, extra_args=[]):
     """
-    运行mysqlbinlog命令并捕获输出,报表可用
+    运行mysqlbinlog命令并捕获输出
     """
     cmd = ['mysqlbinlog', '--base64-output=decode-rows', '-vv'] + extra_args + [binlog_file]
     try:
@@ -20,7 +45,7 @@ def run_mysqlbinlog(binlog_file, extra_args=[]):
 
 def run_mysqlbinlog_robust(binlog_file, extra_args=[]):
     """
-    mysqlbinlog执行，同时处理通用编码问题
+    处理编码问题的方法
     """
     cmd = ['mysqlbinlog', '--base64-output=decode-rows', '-v'] + extra_args + [binlog_file]
     
@@ -51,7 +76,7 @@ def run_mysqlbinlog_robust(binlog_file, extra_args=[]):
 
 def analyze_binlog(binlog_file, starttime=None, stoptime=None):
     """
-    分析binlog，生成统计报告，支持DML和DDL
+    分析binlog，生成统计报告，支持DML事件
     """
     extra_args = []
     if starttime:
@@ -162,7 +187,7 @@ def analyze_binlog(binlog_file, starttime=None, stoptime=None):
 
                 sql_upper = current_sql.upper()
                 if any(kw in sql_upper for kw in ['CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'RENAME']):
-                    stats[key]['updates'] += 1  # DDL事件数
+                    stats[key]['updates'] += 1
                 elif 'INSERT' in sql_upper:
                     stats[key]['inserts'] += 1
                 elif 'UPDATE' in sql_upper:
@@ -207,52 +232,121 @@ def analyze_binlog(binlog_file, starttime=None, stoptime=None):
 
 def parse_binlog_content_enhanced(content, database_filter=None, table_filter=None, flashback_mode='deletes'):
     """
-    binlog内容解析，支持时间/位置过滤
+    binlog内容解析，支持DELETE和UPDATE操作
     """
     operations = []
     
     lines = content.split('\n')
     i = 0
+    current_db = ''
+    current_table = ''
+    
+    log_detail(f"开始解析binlog内容，共{len(lines)}行")
     
     while i < len(lines):
         line = lines[i].strip()
         
-        if 'DELETE FROM' in line and '`' in line:
-            parts = line.split('`')
-            if len(parts) >= 5:
-                db = parts[1]
-                table = parts[3]
-                
-                if database_filter and db != database_filter:
-                    i += 1
-                    continue
-                if table_filter and table != table_filter:
-                    i += 1
-                    continue
-                
-                operation = {
-                    'type': 'DELETE',
-                    'database': db,
-                    'table': table,
-                    'values': []
-                }
-                
-                # 查找字段值
+        table_map = re.search(r'Table_map: `([^`]+)`\.`([^`]+)`', line)
+        if table_map:
+            current_db = table_map.group(1)
+            current_table = table_map.group(2)
+            log_debug(f"找到Table_map: {current_db}.{current_table}")
+        
+        db_match = not database_filter or current_db == database_filter
+        table_match = not table_filter or current_table == table_filter
+        
+        if not (db_match and table_match):
+            i += 1
+            continue
+            
+        if '### DELETE FROM' in line and current_db and current_table:
+            log_debug(f"找到DELETE操作: {current_db}.{current_table}")
+            operation = {
+                'type': 'DELETE',
+                'database': current_db,
+                'table': current_table,
+                'values': []
+            }
+            
+            i += 1
+            while i < len(lines) and lines[i].strip().startswith('###'):
+                field_line = lines[i].strip()
+                if '@' in field_line and '=' in field_line:
+                    value_start = field_line.find('=') + 1
+                    value = field_line[value_start:].strip()
+                    if '/*' in value:
+                        value = value.split('/*')[0].strip()
+                    operation['values'].append(process_field_value(value))
+                    log_debug(f"  DELETE字段值: {value} -> {process_field_value(value)}")
                 i += 1
-                while i < len(lines) and lines[i].strip().startswith('###'):
-                    field_line = lines[i].strip()
-                    if '@' in field_line and '=' in field_line:
-                        # 提取字段值
-                        value_start = field_line.find('=') + 1
-                        value = field_line[value_start:].strip()
-                        operation['values'].append(process_field_value(value))
-                    i += 1
+            
+            if operation['values']:
+                operations.append(operation)
+            continue
                 
-                if operation['values']:
-                    operations.append(operation)
-                    
+        elif '### UPDATE' in line and current_db and current_table:
+            log_debug(f"找到UPDATE操作: {current_db}.{current_table}")
+            operation = {
+                'type': 'UPDATE',
+                'database': current_db,
+                'table': current_table,
+                'old_values': {},
+                'new_values': {}
+            }
+            
+            i += 1
+            current_section = None
+            changed_fields = []
+            
+            while i < len(lines) and lines[i].strip().startswith('###'):
+                field_line = lines[i].strip()
+                
+                if field_line == '### WHERE':
+                    current_section = 'WHERE'
+                    i += 1
+                    continue
+                elif field_line == '### SET':
+                    current_section = 'SET'
+                    i += 1
+                    continue
+                
+                if '@' in field_line and '=' in field_line and current_section:
+                    match = re.match(r'###\s+@(\d+)=(.*)', field_line)
+                    if match:
+                        field_num = int(match.group(1))
+                        value = match.group(2).strip()
+                        if '/*' in value:
+                            value = value.split('/*')[0].strip()
+                        
+                        processed_value = process_field_value(value)
+                        
+                        if current_section == 'WHERE':
+                            operation['old_values'][field_num] = processed_value
+                            log_debug(f"  UPDATE WHERE字段{field_num}: {value} -> {processed_value}")
+                        elif current_section == 'SET':
+                            operation['new_values'][field_num] = processed_value
+                            log_debug(f"  UPDATE SET字段{field_num}: {value} -> {processed_value}")
+                            if field_num not in changed_fields:
+                                changed_fields.append(field_num)
+                
+                i += 1
+            
+            if operation['old_values'] and operation['new_values']:
+                operations.append(operation)
+                if changed_fields and verbose_level >= VERBOSE_DETAIL:
+                    log_detail(f"  更新字段变化:")
+                    for field_num in sorted(changed_fields):
+                        old_val = operation['old_values'].get(field_num, 'NULL')
+                        new_val = operation['new_values'].get(field_num, 'NULL')
+                        if old_val != new_val:
+                            old_display = old_val if len(str(old_val)) < 50 else str(old_val)[:47] + "..."
+                            new_display = new_val if len(str(new_val)) < 50 else str(new_val)[:47] + "..."
+                            log_detail(f"    字段{field_num}: {old_display} → {new_display}")
+            continue
+            
         i += 1
         
+    log_detail(f"解析完成，共找到{len(operations)}个操作")
     return operations
 
 def process_field_value(value):
@@ -264,20 +358,20 @@ def process_field_value(value):
     if value == 'NULL':
         return 'NULL'
     elif value.startswith("'") and value.endswith("'"):
-        
+        # 处理字符串，转义单引号
         inner_value = value[1:-1].replace("'", "''")
         return f"'{inner_value}'"
     elif value.startswith('"') and value.endswith('"'):
-        
+        # 处理双引号字符串
         inner_value = value[1:-1].replace("'", "''")
         return f"'{inner_value}'"
     else:
-        # 其他
+        # 数字或其他类型
         return value
 
 def generate_recovery_sql(operations, flashback_mode='deletes'):
     """
-    生成恢复SQL - 支持deletes
+    生成恢复SQL - 支持DELETE和UPDATE闪回
     """
     sql_statements = []
     
@@ -286,14 +380,42 @@ def generate_recovery_sql(operations, flashback_mode='deletes'):
             values_str = ', '.join(op['values'])
             insert_sql = f"INSERT INTO `{op['database']}`.`{op['table']}` VALUES ({values_str});"
             sql_statements.append(insert_sql)
+            log_detail(f"生成INSERT恢复语句")
+            
+        elif op['type'] == 'UPDATE' and flashback_mode == 'updates':
+            set_parts = []
+            where_parts = []
+            
+            field_nums = sorted(set(op['old_values'].keys()) | set(op['new_values'].keys()))
+            
+            for field_num in field_nums:
+                if field_num in op['old_values'] and field_num in op['new_values']:
+                    set_parts.append(f"`col_{field_num}` = {op['old_values'][field_num]}")
+                    where_parts.append(f"`col_{field_num}` = {op['new_values'][field_num]}")
+            
+            if set_parts and where_parts:
+                set_clause = ", ".join(set_parts)
+                where_clause = " AND ".join(where_parts)
+                update_sql = f"UPDATE `{op['database']}`.`{op['table']}` SET {set_clause} WHERE {where_clause};"
+                sql_statements.append(update_sql)
+                #log_detail(f"生成UPDATE恢复语句")
     
     return sql_statements
 
-def save_to_file(sql_statements, output_file):
-    """保存SQL到文件"""
+def save_to_file(sql_statements, output_file, flashback_mode='deletes'):
+    """
+    保存SQL到文件
+    """
+    mode_description = {
+        'deletes': 'DELETE转INSERT恢复',
+        'updates': 'UPDATE反向恢复',
+        'inserts': 'INSERT转DELETE恢复'
+    }
+    
     with open(output_file, 'w', encoding='utf-8') as f:
         f.write(f"-- Binlog数据恢复SQL\n")
         f.write(f"-- 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"-- 恢复模式: {mode_description.get(flashback_mode, flashback_mode)}\n")
         f.write(f"-- 共 {len(sql_statements)} 条SQL语句\n")
         f.write("-- 请确认SQL正确性后再执行！\n")
         f.write("-- 建议先备份数据\n\n")
@@ -305,14 +427,10 @@ def save_to_file(sql_statements, output_file):
 
 def extract_sql_enhanced(binlog_file, startpos=None, stoppos=None, flashback_mode='deletes',
                         start_datetime=None, stop_datetime=None, database=None, table=None,
-                        output_file=None, direct_parse=False):
-    """
-    flashback_mode:
-        deletes   → 生成 INSERT（回滚删除） - 默认
-        inserts   → 生成 DELETE（回滚插入）
-        updates   → 生成反向 UPDATE
-        None      → 输出原始 SQL（调试用）
-    """
+                        output_file=None, direct_parse=False, verbose=VERBOSE_NORMAL):
+
+    global verbose_level
+    verbose_level = verbose
     
     extra_args = []
     
@@ -325,36 +443,33 @@ def extract_sql_enhanced(binlog_file, startpos=None, stoppos=None, flashback_mod
     if stoppos:
         extra_args.extend(['--stop-position', str(stoppos)])
     
+    log_quiet(f"提取参数: 位置={startpos}-{stoppos}, 数据库={database}, 表={table}, 模式={flashback_mode}")
     
     if direct_parse:
-        print(f"使用直接解析模式: {binlog_file}", file=sys.stderr)
+        log_detail(f"使用直接解析模式")
         
         try:
-            
             temp_file = f"/tmp/binlog_content_{os.getpid()}.txt"
             
             cmd = ['mysqlbinlog', '--base64-output=decode-rows', '-v'] + extra_args + [binlog_file, '>', temp_file]
-            
             
             subprocess.run(' '.join(cmd), shell=True, check=True)
             
             with open(temp_file, 'r', encoding='utf-8', errors='ignore') as f:
                 content = f.read()
             
-            
             os.unlink(temp_file)
             
         except Exception as e:
-            print(f"错误: 直接解析binlog失败: {e}", file=sys.stderr)
+            log_quiet(f"错误: 直接解析binlog失败: {e}")
             return []
     else:
-        print(f"使用标准解析模式: {binlog_file}", file=sys.stderr)
+        log_detail(f"使用标准解析模式")
         content = run_mysqlbinlog_robust(binlog_file, extra_args)
     
     if not content:
-        print("错误: 无法获取binlog内容", file=sys.stderr)
+        log_quiet("错误: 无法获取binlog内容")
         return []
-    
     
     operations = parse_binlog_content_enhanced(
         content, 
@@ -363,16 +478,18 @@ def extract_sql_enhanced(binlog_file, startpos=None, stoppos=None, flashback_mod
         flashback_mode=flashback_mode
     )
     
-    print(f"找到 {len(operations)} 个操作", file=sys.stderr)
+    operation_types = defaultdict(int)
+    for op in operations:
+        operation_types[op['type']] += 1
     
-    # 生成恢复SQL
+    log_normal(f"找到 {len(operations)} 个操作: {dict(operation_types)}")
+    
     sql_statements = generate_recovery_sql(operations, flashback_mode)
     
-    print(f"生成 {len(sql_statements)} 条SQL语句", file=sys.stderr)
+    log_normal(f"生成 {len(sql_statements)} 条SQL语句")
     
-    # 保存到文件或输出到控制台
     if output_file:
-        save_to_file(sql_statements, output_file)
+        save_to_file(sql_statements, output_file, flashback_mode)
     else:
         for sql in sql_statements:
             print(sql)
@@ -393,19 +510,23 @@ if __name__ == "__main__":
         print("  --table TABLE")
         print("  --output OUTPUT_FILE")
         print("  --direct-parse")
-        print("  --flashback-mode {deletes|inserts|updates}")
+        print("  --flashback-mode {deletes|updates|inserts}")
+        print("  --verbose, -v     输出详细程度 (可重复使用: -v, -vv, -vvv)")
         sys.exit(1)
 
     cmd = sys.argv[1].lower()
-    binlog_file = sys.argv[2]
 
     if cmd == "analyze":
+        if len(sys.argv) < 3:
+            print("需要指定binlog文件")
+            sys.exit(1)
+        binlog_file = sys.argv[2]
         starttime = sys.argv[3] if len(sys.argv) > 3 else None
         stoptime = sys.argv[4] if len(sys.argv) > 4 else None
         analyze_binlog(binlog_file, starttime, stoptime)
 
     elif cmd == "extract":
-        parser = argparse.ArgumentParser(description='增强版Binlog数据提取工具')
+        parser = argparse.ArgumentParser(description='Binlog数据提取工具')
         parser.add_argument('--binlog-file', required=True, help='binlog文件路径')
         parser.add_argument('--database', help='数据库名过滤')
         parser.add_argument('--table', help='表名过滤')
@@ -416,11 +537,22 @@ if __name__ == "__main__":
         parser.add_argument('--output', '-o', help='输出文件')
         parser.add_argument('--direct-parse', action='store_true', help='直接解析模式（避免编码问题）')
         parser.add_argument('--flashback-mode', default='deletes', 
-                          choices=['deletes', 'inserts', 'updates'], 
+                          choices=['deletes', 'updates', 'inserts'], 
                           help='闪回模式')
+        parser.add_argument('--verbose', '-v', action='count', default=1,
+                          help='增加输出详细程度 (可重复使用: -v, -vv, -vvv)')
         
         # 解析参数（跳过前两个参数：脚本名和命令）
         args = parser.parse_args(sys.argv[2:])
+        
+        # 映射verbose计数到级别常量
+        verbosity_map = {
+            0: VERBOSE_QUIET,
+            1: VERBOSE_NORMAL,
+            2: VERBOSE_DETAIL,
+            3: VERBOSE_DEBUG
+        }
+        verbose_level = verbosity_map.get(args.verbose, VERBOSE_NORMAL)
         
         extract_sql_enhanced(
             binlog_file=args.binlog_file,
@@ -432,8 +564,10 @@ if __name__ == "__main__":
             database=args.database,
             table=args.table,
             output_file=args.output,
-            direct_parse=args.direct_parse
+            direct_parse=args.direct_parse,
+            verbose=verbose_level
         )
 
     else:
         print("Unknown command")
+

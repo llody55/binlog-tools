@@ -74,6 +74,7 @@ python binlog_tool_rollback.py extract \
 | `--output`, `-o` | 输出文件（默认输出到控制台）                       |
 | `--flashback-mode` | 闪回模式：deletes/inserts/updates（默认: deletes） |
 | `--direct-parse`   | 直接解析模式（避免编码问题）                       |
+| `--verbose`        | 输出详细程度(可使用: -v, -vv, -vvv)                |
 
 ### 闪回模式说明
 
@@ -135,7 +136,7 @@ python binlog_tool_rollback.py extract \
 
 ## 输出示例
 
-### DDL报表示例
+### DML报表示例
 
 ```plaintext
 binlog              starttime            stoptime             startpos    stoppos     inserts updates deletes database            table   
