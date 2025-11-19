@@ -540,7 +540,7 @@ if __name__ == "__main__":
                           choices=['deletes', 'updates', 'inserts'], 
                           help='闪回模式')
         parser.add_argument('--verbose', '-v', action='count', default=1,
-                          help='增加输出详细程度 (可重复使用: -v, -vv, -vvv)')
+                          help='输出详细程度 (可重复使用: -v, -vv, -vvv)')
         
         # 解析参数（跳过前两个参数：脚本名和命令）
         args = parser.parse_args(sys.argv[2:])
